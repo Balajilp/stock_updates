@@ -1,0 +1,144 @@
+-- SLA Dashboard Dataset Publishing query backup before updating SLA Days table on query and after updating null values
+
+-- query for 4
+with base as (
+
+select * from (
+select *, 
+    case
+		WHEN "Status" = 'Published' THEN TO_CHAR(mrc_start_timestamp, 'MM/DD/YYYY HH12:MI AM')
+	    WHEN "Status" = 'Not Published' AND ("airflow_status" IS NULL OR "airflow_status" = 'SUCCESS') AND ("job_status" IS NULL OR "job_status" = 'Success') AND ("validation_status" IS NULL OR "validation_status" = 'Success') AND "mrl_status" = 'success' AND "dpc_publish_flag" is null THEN 'Publish Flag Is Null '
+        WHEN "Status" = 'Not Published' AND ("airflow_status" IS NULL OR "airflow_status" = 'SUCCESS') AND ("job_status" IS NULL OR "job_status" = 'Success') AND ("validation_status" IS NULL OR "validation_status" = 'Success') AND "mrl_status" <> 'success' THEN 'MV Refresh Status : ' || "mrl_status"
+        WHEN "Status" = 'Not Published' AND ("airflow_status" IS NULL OR "airflow_status" = 'SUCCESS') AND ("job_status" IS NULL OR "job_status" = 'Success') AND ("validation_status" IS NOT NULL AND "validation_status" <> 'Success') THEN 'Validation Status : ' || "validation_status"
+        WHEN "Status" = 'Not Published' AND ("airflow_status" IS NULL OR "airflow_status" = 'SUCCESS') AND ("job_status" IS NOT NULL AND "job_status" <> 'Success') THEN 'Job Status : ' || "job_status"
+		WHEN "Status" = 'Not Published' AND ("airflow_status" IS NOT NULL AND "airflow_status" <> 'SUCCESS') THEN 'Airflow Status' || "airflow_status"
+		WHEN "Status" = 'N/A' then ''
+        ELSE 'Others'
+    END AS "Reason" from (
+
+SELECT
+    *,
+    CASE
+        WHEN "PublishType" = 'Delivery-2' THEN 'N/A'
+        WHEN "PublishType" = 'Delivery-1' AND "archetypename" = 'wallet customer level' THEN 'N/A'
+        WHEN "mrl_status" = 'success' AND "dpc_publish_flag" = 1 THEN 'Published'
+        ELSE 'Not Published'
+    END AS "Status",
+    "PublishType"||' ('||"PublishType 1"||')' AS "Publish Type"
+FROM 
+ (
+select *, 
+      CASE
+        WHEN EXTRACT(YEAR FROM AGE(TO_DATE(t2.year_month_range, 'YYYYMM'), TO_DATE(t1.mrl_period_id, 'YYYYMM'))) * 12
+             + EXTRACT(MONTH FROM AGE(TO_DATE(t2.year_month_range, 'YYYYMM'), TO_DATE(t1.mrl_period_id, 'YYYYMM'))) = 1 THEN 'Delivery-1'
+        WHEN EXTRACT(YEAR FROM AGE(TO_DATE(t2.year_month_range, 'YYYYMM'), TO_DATE(t1.mrl_period_id, 'YYYYMM'))) * 12
+             + EXTRACT(MONTH FROM AGE(TO_DATE(t2.year_month_range, 'YYYYMM'), TO_DATE(t1.mrl_period_id, 'YYYYMM'))) = 2 THEN 'Delivery-2'
+        WHEN EXTRACT(YEAR FROM AGE(TO_DATE(t2.year_month_range, 'YYYYMM'), TO_DATE(t1.mrl_period_id, 'YYYYMM'))) * 12
+             + EXTRACT(MONTH FROM AGE(TO_DATE(t2.year_month_range, 'YYYYMM'), TO_DATE(t1.mrl_period_id, 'YYYYMM'))) = 3 THEN 'Delivery-3'
+        ELSE 'Other'
+    END AS "PublishType",
+    TO_CHAR(TO_DATE(t1.mrl_period_id, 'YYYYMM'), 'Mon-YY') as "PublishType 1"
+from (
+select distinct
+mrl.config_id as mrl_config_id, mrl.period_id as mrl_period_id, mrl.status as mrl_status, mrl.refresh_summary as mrl_publish_summary,
+mrc.status as mrc_status, mrc.start_timestamp as mrc_start_timestamp,
+dpc.publish_flag as dpc_publish_flag, dpc.reporting_date,
+UPPER(concat(cdc.region,  cdc.study)) as "Study", cdc.clientid as "Client Id", bankid as "Bank Id", cdc.archetypename, 
+bmd.bank_name as "Bank Name",
+ps.process, ps.status as airflow_status, ps.start_time,
+jl.job_status,
+cvre.final_status as validation_status
+from argus20_us_ccps_lookups.mv_refresh_log mrl
+inner join (
+with RankRecord1 as 	
+		(select distinct *, row_number() over(partition by config_id order by start_timestamp desc) as row_num1  
+		from argus20_us_ccps_lookups.mv_refresh_control mrc)
+
+select *
+from RankRecord1 r1 
+where r1.row_num1 = 1) as mrc
+on mrl.refresh_id = mrc.refresh_id and mrl.config_id = mrc.config_id 
+inner join argus20_us_ccps_lookups.dataset_publish_control dpc 
+on mrl.config_id = dpc.config_id and mrl.period_id = dpc.period_id 
+inner join argus20_us_ccps_lookups.client_dataset_config cdc 
+on cdc.configid = mrc.config_id 
+inner join argus20_tableau_dashboards.bank_mapping_data_dashboards bmd
+on bmd.bank_id = cdc.bankid 
+left outer join (
+with RankRecord as 	
+		(select distinct *, row_number() over(partition by period_id order by start_time desc) as row_num  
+		from airflow_automation_meta.processing_status ps where ps.process = 'ARG20_US_CCPS_MV_REFRESH')
+
+select *
+from RankRecord r 
+where r.row_num = 1) as ps 
+on ps.period_id = mrl.period_id 
+left outer join (
+with RankRecord2 as 	
+		(select distinct *, row_number() over(partition by period_id, config_id, archetype_name order by job_end_ts desc) as row_num2  
+		from argus20_us_ccps_lookups.jobs_log jl)
+
+select *
+from RankRecord2 r2 
+where r2.row_num2 = 1) as jl
+on cast(jl.period_id as text) = ps.period_id and jl.config_id = mrl.config_id and jl.archetype_name = cdc.archetypename
+left outer join (
+SELECT
+    t1.config_id,
+    CASE
+        WHEN COUNT(*) = COUNT(CASE WHEN t2.result_type = 'Success' THEN 1 END) THEN 'Success'
+        ELSE 'failure'
+    END AS final_status
+FROM
+    argus20_us_ccps_lookups.config_validation_rules t1
+INNER JOIN
+    argus20_us_ccps_lookups.config_validation_rules_exec t2 ON t1.validation_id = t2.validation_id
+GROUP BY
+    t1.config_id) as cvre
+on jl.config_id = cvre.config_id
+) as t1 right outer join (SELECT 
+    TO_CHAR(DATE_TRUNC('month', NOW() - INTERVAL '1 month' * generate_series(11, 0, -1)), 'YYYYMM') AS year_month_range,
+    TO_CHAR(TO_DATE(TO_CHAR(DATE_TRUNC('month', NOW() - INTERVAL '1 month' * generate_series(11, 0, -1)), 'YYYYMM'), 'YYYYMM'), 'Mon-YY') AS Calendar_Month
+    ) as t2
+    on 
+
+    --TO_CHAR(DATE_TRUNC('month', TO_DATE(t2.year_month_range, 'YYYYMM')) - INTERVAL '1 MONTH', 'YYYYMM') = t1.mrl_period_id
+    --OR TO_CHAR(DATE_TRUNC('month', TO_DATE(t2.year_month_range, 'YYYYMM')) - INTERVAL '2 MONTH', 'YYYYMM') = t1.mrl_period_id
+    --or 
+    TO_CHAR(DATE_TRUNC('month', TO_DATE(t2.year_month_range, 'YYYYMM')) - INTERVAL '3 MONTH', 'YYYYMM') = t1.mrl_period_id) as x) as y) as z
+    
+ 
+ --  
+ where z."Status" <> 'N/A' and z."PublishType" = 'Delivery-3' or z."PublishType" = 'Other'
+  ORDER BY TO_DATE(z.year_month_range, 'YYYYMM') desc ),
+ 
+     calc_SLA as 
+               (select *,TO_DATE(mrl_period_id, 'YYYYMM') + INTERVAL '1 month' + INTERVAL '90 days' AS DG_Delivery3 from base),
+     SLA_diff as 
+               (select *, DATE_PART('day', mrc_start_timestamp - dg_delivery3) AS day_difference from calc_SLA),
+     SLA_met_miss as 
+                (select *, case when mrl_status = 'success' and day_difference <= 0 then 'SLA Met'
+                                else 'SLA Miss' end as SLA_Status from SLA_diff),
+     SLA_met_miss_1 as (select *, case when mrl_status = 'success' and day_difference <=0 then 'Completed-SLA Met'
+                                       when mrl_status <> 'success' then 'Not Completed-SLA Miss'
+                                       when mrl_status = 'success' and day_difference > 0 then 'Completed-SLA Miss' end as SLA_Status_1
+                        from SLA_met_miss),
+     temp_3 as (select * from SLA_met_miss_1 where "Study" is null),
+     temp_2 as (select t1.*, t2.* from public.dash_1 as t1 cross join temp_3 as t2),-- select * from temp_2
+     temp_4 as (select * from SLA_met_miss_1 where "Study" is not null),
+     temp_5 as (select * from (select * from public.dash_1 d1 cross join (select distinct calendar_month calendar_month_1 from temp_4) t4) t1 left outer join temp_4 t2 on ((t1."Publish Type 2" = t2."PublishType") and (t1."Cube Type" = t2.archetypename) and (t1.calendar_month_1 = coalesce (t2.calendar_month,t1.calendar_month_1)))),
+     --select * from temp_5
+     temp_6 as (select * from temp_2 union all select "Cube Type","Publish Type 2",mrl_config_id, mrl_period_id, mrl_status, mrl_publish_summary, mrc_status, mrc_start_timestamp, dpc_publish_flag, reporting_date, "Study", "Client Id", "Bank Id", archetypename, "Bank Name",process, airflow_status, start_time, job_status, validation_status, year_month_range, calendar_month_1, "PublishType", "PublishType 1","Status", "Publish Type", "Reason", dg_delivery3, day_difference, sla_status, sla_status_1 from temp_5),
+     temp_7 as (select "Cube Type" as "Cube Type 1","Publish Type 2",mrl_config_id, coalesce(mrl_period_id, CASE 
+        WHEN "Publish Type 2" = 'Delivery-1' THEN TO_CHAR(TO_DATE(year_month_range, 'YYYYMM') - INTERVAL '1 month', 'YYYYMM')
+        WHEN "Publish Type 2" = 'Delivery-2' THEN TO_CHAR(TO_DATE(year_month_range, 'YYYYMM') - INTERVAL '2 months', 'YYYYMM')
+        WHEN "Publish Type 2" = 'Delivery-3' THEN TO_CHAR(TO_DATE(year_month_range, 'YYYYMM') - INTERVAL '3 months', 'YYYYMM')
+        ELSE year_month_range  -- Handle other cases, or you can return NULL if needed
+    END ) as mrl_period_id, coalesce(mrl_status,'N/A') as mrl_status, mrl_publish_summary, coalesce(mrc_status, 'N/A') as mrc_status, mrc_start_timestamp, dpc_publish_flag, reporting_date, coalesce("Study",'USCCPS') as "Study", "Client Id", "Bank Id", coalesce(archetypename, "Cube Type") as archetypename, "Bank Name",process, airflow_status, start_time, job_status, validation_status, year_month_range, calendar_month, case when  "PublishType" = 'Other' and "Study" is null  then "Publish Type 2" else "PublishType" end as "PublishType", case when "Study" is null and "PublishType 1" is null then TO_CHAR(TO_DATE(coalesce(mrl_period_id, CASE 
+        WHEN "Publish Type 2" = 'Delivery-1' THEN TO_CHAR(TO_DATE(year_month_range, 'YYYYMM') - INTERVAL '1 month', 'YYYYMM')
+        WHEN "Publish Type 2" = 'Delivery-2' THEN TO_CHAR(TO_DATE(year_month_range, 'YYYYMM') - INTERVAL '2 months', 'YYYYMM')
+        WHEN "Publish Type 2" = 'Delivery-3' THEN TO_CHAR(TO_DATE(year_month_range, 'YYYYMM') - INTERVAL '3 months', 'YYYYMM')
+        ELSE year_month_range  -- Handle other cases, or you can return NULL if needed
+    END ) , 'YYYYMM'), 'Mon-YY') else "PublishType 1" end as "PublishType 1", "Status", "Publish Type", "Reason", dg_delivery3, day_difference, case when "Study" is null and sla_status = 'SLA Miss' then 'N/A' else sla_status end as sla_status, case when "Study" is null and sla_status_1 is null then 'N/A' else sla_status_1 end as sla_status_1 from temp_6 where "Publish Type 2"='Delivery-3'),
+    temp_8 as (select mrl_config_id, mrl_period_id, mrl_status, mrl_publish_summary, mrc_status, mrc_start_timestamp, dpc_publish_flag, reporting_date, "Study", "Client Id", "Bank Id", archetypename, "Bank Name", process, airflow_status, start_time, job_status, validation_status, year_month_range, calendar_month, "PublishType", "PublishType 1", "Status", case when "Publish Type" is null then "PublishType"||' ('||"PublishType 1"||')' else "Publish Type" end as "Publish Type", "Reason", dg_delivery3, day_difference,sla_status, sla_status_1 from temp_7)
+    select * from temp_8

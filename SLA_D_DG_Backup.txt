@@ -1,0 +1,121 @@
+-- SLA Dashboard Dataset generation query backup before updating SLA Days table on query and after updating null values
+
+with pr as 
+                        (SELECT clasification_code, process, period_id as str_period_id, MAX(start_time) AS start_timestamp, max(end_time) as end_timestamp
+                         FROM airflow_automation_meta.processing_status ps
+                         GROUP BY clasification_code, process, period_id),
+     processing_status as 
+                         (select ps.status, pr.*, case when SPLIT_PART(pr.process, '_', 4) = 'PIT' and SPLIT_PART(pr.process, '_', 6)= 'BANK' and SPLIT_PART(pr.process, '_', 6)||'_'||SPLIT_PART(pr.process, '_', 7)  = 'BANK_ACTUALS' then 'Delivery-3'
+                                                        when SPLIT_PART(pr.process, '_', 4) = 'PIT' and SPLIT_PART(pr.process, '_', 6)= 'BENCH' and SPLIT_PART(pr.process, '_', 7)||'_'||SPLIT_PART(pr.process, '_', 8)  = 'CUSTOM_ACTUALS' then 'Delivery-3'
+                                                        when SPLIT_PART(pr.process, '_', 4) = 'PIT' and SPLIT_PART(pr.process, '_', 6)= 'BENCH' and SPLIT_PART(pr.process, '_', 7)||'_'||SPLIT_PART(pr.process, '_', 8)  = 'INDUSTRY_ACTUALS' then 'Delivery-3'
+                                                        when split_part(pr.process, '_', 4) = 'WALLET' then 'Delivery-3' 
+                                                        end as "PublishType" from airflow_automation_meta.processing_status ps inner join pr on 
+                          ps.clasification_code = pr.clasification_code and ps.process = pr.process and ps.period_id = pr.str_period_id and
+                          ps.start_time = pr.start_timestamp and ps.end_time = pr.end_timestamp),
+    
+     --jl as (select * from argus20_us_ccps_lookups.jobs_log jl where jl.pipeline_type not ilike '%525' and jl.pipeline_type not ilike '%5/25')  ,                  
+     ps_jl as 
+             (SELECT *
+            FROM processing_status ps
+            INNER JOIN argus20_us_ccps_lookups.jobs_log jl
+            ON --jl.job_start_ts BETWEEN ps.start_timestamp AND ps.end_timestamp 
+            --and  
+                CASE 
+                    WHEN LOWER(SPLIT_PART(ps.process, '_', 4)) = 'pit' THEN 'point in time'
+                    WHEN LOWER(SPLIT_PART(ps.process, '_', 4)) = 'wallet' THEN 'wallet customer level'
+                   ELSE SPLIT_PART(ps.process, '_', 4)
+                END = jl.archetype_name 
+            and 
+            case when SPLIT_PART(ps.process, '_', 4) = 'PIT' and lower(SPLIT_PART(ps.process, '_', 6))||'-'||lower(SPLIT_PART(ps.process, '_', 7)) = 'bank-actuals' then 'bank'
+                when SPLIT_PART(ps.process, '_', 4) = 'PIT'  and lower(SPLIT_PART(ps.process, '_', 6))||'-'||lower(SPLIT_PART(ps.process, '_', 7))||'-'||lower(SPLIT_PART(ps.process, '_', 8)) = 'bench-industry-actuals' then 'bench-industry-525'
+                when SPLIT_PART(ps.process, '_', 4) = 'PIT'  and lower(SPLIT_PART(ps.process, '_', 6))||'-'||lower(SPLIT_PART(ps.process, '_', 7))||'-'||lower(SPLIT_PART(ps.process, '_', 8)) = 'bench-custom-actuals' then 'bench-custom-525'
+                when SPLIT_PART(ps.process, '_', 4) = 'WALLET' then 'Wallets-Combine onus & offus' 
+                end = jl.pipeline_type 
+            and 
+            ps.str_period_id ::integer = jl.period_id),-- select * from ps_jl
+            
+    ps_jl_cdc as 
+                (select * from ps_jl inner join argus20_us_ccps_lookups.client_dataset_config cdc
+                 on ps_jl.config_id = cdc.configid),
+    ps_jl_cdc_bmd_nongroup as 
+                (select *  from ps_jl_cdc inner join argus20_tableau_dashboards.bank_mapping_data_dashboards bmd
+                on ps_jl_cdc.bankid = bmd.bank_id),-- select * from ps_jl_cdc_bmd_nongroup
+    ps_jl_cdc_bmd as (select clasification_code, str_period_id, bankid, bank_name, clientid, config_id, archetype_name, "PublishType",CASE
+                             WHEN COUNT(*) = COUNT(CASE WHEN status = 'SUCCESS' THEN 1 END) THEN 'SUCCESS'
+                             ELSE 'FAILED'
+                             END AS status,
+                             max(job_start_ts) as start_timestamp, max(job_end_ts) as end_timestamp
+                            from ps_jl_cdc_bmd_nongroup group by clasification_code, str_period_id, bankid, bank_name, clientid, config_id, archetype_name, "PublishType"), --select * from ps_jl_cdc_bmd
+    t2 as 
+         (SELECT 
+    TO_CHAR(DATE_TRUNC('month', NOW() - INTERVAL '1 month' * generate_series(11, 0, -1)), 'YYYYMM') AS year_month_range,
+    TO_CHAR(TO_DATE(TO_CHAR(DATE_TRUNC('month', NOW() - INTERVAL '1 month' * generate_series(11, 0, -1)), 'YYYYMM'), 'YYYYMM'), 'Mon-YY') AS Calendar_Month
+     )
+     ,
+    join_3_month as 
+            (select * from ps_jl_cdc_bmd as t1 right outer join t2 
+             on 
+TO_CHAR(DATE_TRUNC('month', TO_DATE(t2.year_month_range, 'YYYYMM')) - INTERVAL '3 MONTH', 'YYYYMM') = t1.str_period_id),
+    select_columns as 
+                     (select clasification_code, str_period_id, status, start_timestamp, end_timestamp, archetype_name, config_id, clientid, bankid, bank_name,  year_month_range, calendar_month, "PublishType"  from join_3_month), 
+    calc_SLA as 
+               (select *,case when "PublishType" = 'Delivery-1' then TO_DATE(str_period_id, 'YYYYMM') + INTERVAL '1 month' + INTERVAL '20 days' 
+                        when "PublishType" = 'Delivery-2' then TO_DATE(str_period_id, 'YYYYMM') + INTERVAL '1 month' + INTERVAL '47 days' 
+                        when "PublishType" = 'Delivery-3' then TO_DATE(str_period_id, 'YYYYMM') + INTERVAL '1 month' + INTERVAL '80 days' 
+                        end as DG_Delivery3 from select_columns),
+    SLA_diff as 
+               (select *, DATE_PART('day', end_timestamp - dg_delivery3) AS day_difference from calc_SLA),
+    SLA_met_miss as 
+                   (select *, case when status = 'SUCCESS' and day_difference <= 0 then 'SLA Met'
+                                else 'SLA Miss' end as SLA_Status from SLA_diff),--optional we can remove
+    SLA_met_miss_1 as (select *, case when status = 'SUCCESS' and day_difference <= 0 then 'Completed-SLA Met' 
+                                      when status <> 'SUCCESS' then 'Not Completed-SLA Miss'
+                                      when status = 'SUCCESS' and day_difference > 0 then 'Completed-SLA Miss' end as SLA_Status_1
+                       from SLA_met_miss),
+    PublishType1 as 
+                   (select * , TO_CHAR(TO_DATE(str_period_id, 'YYYYMM'), 'Mon-YY') as "PublishType 1"
+                    from SLA_met_miss_1),
+    PublishType2 as 
+                   (select *, "PublishType"||' ('||"PublishType 1"||')' AS "Publish Type"
+                    from PublishType1),
+  temp_3 as (select * from PublishType2 where clasification_code is null),
+  temp_2 as (select t1.*, t2.* from public.dash_1 as t1 cross join temp_3 as t2),
+  temp_4 as (select * from PublishType2 where clasification_code is not null),-- select * from temp_4 where calendar_month = 'Oct-23'
+  temp_5 as (select * from (select * from public.dash_1 d1 cross join (select distinct calendar_month calendar_month_1 from temp_4) t4) t1 left outer join temp_4 t2 on ((t1."Publish Type 2" = t2."PublishType") and (t1."Cube Type" = t2.archetype_name) and (t1.calendar_month_1 = coalesce (t2.calendar_month,t1.calendar_month_1)))),
+  temp_6 as (select * from temp_2 union all select "Cube Type","Publish Type 2",clasification_code,str_period_id,status,start_timestamp,end_timestamp,archetype_name,config_id,clientid,bankid,bank_name,year_month_range,calendar_month_1,"PublishType",dg_delivery3,day_difference,sla_status,sla_status_1,"PublishType 1","Publish Type"
+ from temp_5),
+ temp_7 as (select "Cube Type" as "Cube Type 1", "Publish Type 2", clasification_code,str_period_id,status,start_timestamp,end_timestamp,archetype_name,config_id,clientid,bankid,bank_name,year_month_range,calendar_month,"PublishType",dg_delivery3,day_difference,sla_status,sla_status_1,"PublishType 1","Publish Type" from temp_6 where "Publish Type 2" = 'Delivery-3'),
+ temp_8 as (select "Cube Type 1", "Publish Type 2", clasification_code,coalesce(str_period_id,     CASE 
+        WHEN "Publish Type 2" = 'Delivery-1' THEN TO_CHAR(TO_DATE(year_month_range, 'YYYYMM') - INTERVAL '1 month', 'YYYYMM')
+        WHEN "Publish Type 2" = 'Delivery-2' THEN TO_CHAR(TO_DATE(year_month_range, 'YYYYMM') - INTERVAL '2 months', 'YYYYMM')
+        WHEN "Publish Type 2" = 'Delivery-3' THEN TO_CHAR(TO_DATE(year_month_range, 'YYYYMM') - INTERVAL '3 months', 'YYYYMM')
+        ELSE year_month_range  -- Handle other cases, or you can return NULL if needed
+    END ) as str_period_id,status,start_timestamp,end_timestamp,archetype_name,config_id,clientid,bankid,bank_name,year_month_range,calendar_month,"PublishType",dg_delivery3,day_difference,sla_status,sla_status_1,"PublishType 1","Publish Type" from temp_7),
+ handle_null as (select COALESCE(clasification_code, 'USCCPS') AS clasification_code, 
+    str_period_id,
+    coalesce(status, 'N/A') as status,
+    start_timestamp,
+    end_timestamp,
+    coalesce(archetype_name, "Cube Type 1") as archetype_name,
+    --coalesce(config_id, 'N/A') as config_id,
+    config_id,
+    --coalesce(clientid, 'N/A') as clientid,
+    clientid,
+    --coalesce(bankid, 'N/A') as bankid,
+    bankid,
+    coalesce(bank_name, 'N/A') as bank_name,
+    year_month_range,
+    calendar_month,
+    coalesce("PublishType", "Publish Type 2") as "PublishType",
+    dg_delivery3,
+    day_difference,
+    case when clasification_code is null and sla_status = 'SLA Miss' then 'N/A' else sla_status end as sla_status,
+    case when clasification_code is null and sla_status = 'SLA Miss' then 'N/A' else sla_status_1 end as sla_status_1,
+    case when clasification_code is null and "PublishType 1" is null then TO_CHAR(TO_DATE(str_period_id, 'YYYYMM'), 'Mon-YY') else "PublishType 1" end as "PublishType 1",
+    --case when "Publish Type" is null then "PublishType"||' ('||"PublishType 1"||')' else "Publish Type" end as "Publish Type"
+    "Publish Type"
+
+    from temp_8),
+    fin_tble as (select clasification_code,str_period_id,status,start_timestamp,end_timestamp,archetype_name,config_id,clientid,bankid,bank_name,year_month_range,calendar_month,"PublishType",dg_delivery3,day_difference,sla_status,sla_status_1,"PublishType 1",case when "Publish Type" is null then "PublishType"||' ('||"PublishType 1"||')' else "Publish Type" end as "Publish Type" from handle_null)
+ select * 
+from fin_tble
